@@ -147,3 +147,75 @@ def test_gemini_rate_limit_can_block_call(monkeypatch):
     service._recent_requests.append(service.time.monotonic())
     with pytest.raises(RuntimeError, match="лимит"):
         run(service.analyze_with_gemini("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "test", "quick"))
+
+
+@pytest.mark.parametrize('params', [[], False, 0, None])
+def test_invalid_rpc_params(params):
+    response = run(call({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': params}))
+    assert response.json()['error']['code'] == -32602
+
+
+@pytest.mark.parametrize('body', [
+    {'jsonrpc': '2.0', 'id': 1},
+    {'jsonrpc': '2.0', 'id': [], 'method': 'ping'},
+    {'jsonrpc': '2.0', 'id': True, 'method': 'ping'},
+])
+def test_invalid_rpc_envelope(body):
+    assert run(call(body)).json()['error']['code'] == -32600
+
+
+def test_invalid_protocol_version():
+    result = run(call({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                       'params': {'protocolVersion': []}}))
+    assert result.json()['error']['code'] == -32602
+
+
+@pytest.mark.parametrize('name,args', [
+    ('youtube_mcp_status', {'extra': True}),
+    ('analyze_youtube_video', {}),
+    ('inspect_youtube_moment', {'url': 'https://youtu.be/dQw4w9WgXcQ'}),
+])
+def test_schema_is_enforced(name, args):
+    result = run(service._invoke_tool(name, args))
+    assert result['isError'] is True
+    assert not service._recent_requests
+
+
+@pytest.mark.parametrize('payload', [
+    [], {'status': 'completed', 'steps': None},
+    {'status': 'completed', 'steps': [None]},
+    {'status': 'completed', 'steps': [{'type': 'model_output', 'content': None}]},
+    {'status': 'completed', 'steps': [{'type': 'model_output', 'content': [{'type': 'text', 'text': 123}]}]},
+])
+def test_malformed_upstream_is_controlled(monkeypatch, payload):
+    monkeypatch.setenv('GEMINI_API_KEY', 'fake-key')
+    client_class = httpx.AsyncClient
+    def factory(**kwargs):
+        return client_class(**kwargs, transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload)))
+    monkeypatch.setattr(service.httpx, 'AsyncClient', factory)
+    with pytest.raises(RuntimeError, match='формат'):
+        run(service.analyze_with_gemini('https://youtu.be/dQw4w9WgXcQ', 'test', 'visual'))
+
+
+@pytest.mark.parametrize('status', [400, 401, 403, 404, 429, 500, 503])
+def test_upstream_errors_do_not_expose_body(monkeypatch, status):
+    monkeypatch.setenv('GEMINI_API_KEY', 'fake-key')
+    client_class = httpx.AsyncClient
+    def factory(**kwargs):
+        return client_class(**kwargs, transport=httpx.MockTransport(lambda request: httpx.Response(status, text='PRIVATE UPSTREAM DETAIL')))
+    monkeypatch.setattr(service.httpx, 'AsyncClient', factory)
+    with pytest.raises(RuntimeError) as exc:
+        run(service.analyze_with_gemini('https://youtu.be/dQw4w9WgXcQ', 'test', 'visual'))
+    assert 'PRIVATE' not in str(exc.value)
+
+
+def test_upstream_protocol_error_is_controlled(monkeypatch):
+    monkeypatch.setenv('GEMINI_API_KEY', 'fake-key')
+    client_class = httpx.AsyncClient
+    def handler(request):
+        raise httpx.RemoteProtocolError('PRIVATE transport detail')
+    def factory(**kwargs):
+        return client_class(**kwargs, transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(service.httpx, 'AsyncClient', factory)
+    with pytest.raises(RuntimeError, match='не отвечает'):
+        run(service.analyze_with_gemini('https://youtu.be/dQw4w9WgXcQ', 'test', 'visual'))
