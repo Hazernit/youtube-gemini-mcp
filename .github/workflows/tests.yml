@@ -1,0 +1,27 @@
+name: Python tests
+
+on:
+  push:
+    branches:
+      - main
+      - feat/google-cloud-run-mcp
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Check syntax
+        run: python -m compileall -q app.py
+      - name: Run MCP unit tests (mock Gemini API)
+        run: python -m pytest -q
