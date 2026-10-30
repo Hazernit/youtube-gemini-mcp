@@ -112,7 +112,7 @@ async def analyze_with_gemini(youtube_url: str, prompt: str, mode: str) -> str:
                 json=payload,
                 headers={"x-goog-api-key": key, "Content-Type": "application/json"},
             )
-    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+    except httpx.RequestError as exc:
         raise RuntimeError("Gemini сейчас не отвечает. Повтори запрос позднее.") from exc
     if response.status_code != 200:
         statuses = {
@@ -126,15 +126,30 @@ async def analyze_with_gemini(youtube_url: str, prompt: str, mode: str) -> str:
         raise RuntimeError(statuses.get(response.status_code, f"Gemini ответил ошибкой HTTP {response.status_code}."))
     try:
         data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("Expected an object")
         if data.get("status") != "completed":
             raise RuntimeError("Gemini не завершил обработку видео, повтори попытку позже.")
-        pieces = [
-            part.get("text", "")
-            for step in data.get("steps", [])
-            if step.get("type") == "model_output"
-            for part in step.get("content", [])
-            if isinstance(part, dict) and part.get("type") == "text"
-        ]
+        steps = data.get("steps", [])
+        if not isinstance(steps, list):
+            raise ValueError("Expected steps array")
+        pieces = []
+        for step in steps:
+            if not isinstance(step, dict):
+                raise ValueError("Expected step object")
+            if step.get("type") != "model_output":
+                continue
+            content = step.get("content", [])
+            if not isinstance(content, list):
+                raise ValueError("Expected content array")
+            for part in content:
+                if not isinstance(part, dict):
+                    raise ValueError("Expected content object")
+                if part.get("type") == "text":
+                    value = part.get("text")
+                    if not isinstance(value, str):
+                        raise ValueError("Expected text string")
+                    pieces.append(value)
     except (ValueError, AttributeError, TypeError) as exc:
         raise RuntimeError("Gemini вернул неожиданный формат ответа.") from exc
     result = "\n".join(p.strip() for p in pieces if p.strip())
@@ -221,6 +236,14 @@ def _validate_moment(value: str) -> str:
 
 async def _invoke_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
+        schemas = {tool["name"]: tool["inputSchema"] for tool in TOOLS}
+        if name not in schemas:
+            return _text_result("Неизвестный инструмент.", error=True)
+        schema = schemas[name]
+        if set(arguments) - set(schema["properties"]):
+            raise ValueError("Переданы неизвестные параметры инструмента.")
+        if any(key not in arguments for key in schema.get("required", [])):
+            raise ValueError("Не переданы обязательные параметры инструмента.")
         if name == "youtube_mcp_status":
             quota = _env_int("MAX_CALLS_PER_DAY", 15, 1, 100)
             now = time.monotonic()
@@ -303,16 +326,23 @@ async def mcp_endpoint(token: str, request: Request) -> Response:
         return _jsonrpc_response(None, error={"code": -32700, "message": "Parse error"})
     if not isinstance(body, dict) or body.get("jsonrpc") != "2.0":
         return _jsonrpc_response(None, error={"code": -32600, "message": "Invalid Request"})
+    method = body.get("method")
+    if not isinstance(method, str) or ("id" in body and (
+        isinstance(body["id"], bool) or not isinstance(body["id"], (str, int, type(None)))
+    )):
+        return _jsonrpc_response(None, error={"code": -32600, "message": "Invalid Request"})
     if "id" not in body:
         # notifications/initialized and other notifications are acknowledged.
         return Response(status_code=202)
     msg_id = body["id"]
     method = body.get("method")
-    params = body.get("params") or {}
+    params = body.get("params", {})
     if not isinstance(params, dict):
         return _jsonrpc_response(msg_id, error={"code": -32602, "message": "Invalid params"})
     if method == "initialize":
         wanted = params.get("protocolVersion", PROTOCOL_VERSION)
+        if not isinstance(wanted, str):
+            return _jsonrpc_response(msg_id, error={"code": -32602, "message": "Invalid protocolVersion"})
         protocol = wanted if wanted in SUPPORTED_VERSIONS else PROTOCOL_VERSION
         return _jsonrpc_response(msg_id, {
             "protocolVersion": protocol,
@@ -326,7 +356,7 @@ async def mcp_endpoint(token: str, request: Request) -> Response:
         return _jsonrpc_response(msg_id, {"tools": TOOLS})
     if method == "tools/call":
         name = params.get("name")
-        arguments = params.get("arguments") or {}
+        arguments = params.get("arguments", {})
         if not isinstance(name, str) or not isinstance(arguments, dict):
             return _jsonrpc_response(msg_id, error={"code": -32602, "message": "Invalid tool parameters"})
         return _jsonrpc_response(msg_id, await _invoke_tool(name, arguments))
